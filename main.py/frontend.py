@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date
 from io import BytesIO
@@ -11,11 +12,14 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 
 import pandas as pd
 import streamlit as st
+from langchain_core.exceptions import ModelRateLimitError
+from langchain_openai.chat_models.base import OpenAIConnectionError
+from openai import LengthFinishReasonError
 
 # -----------------------------
 # Import your compiled LangGraph app
 # -----------------------------
-from blog_writing_backend import app
+from backend import app, content_evaluator_node, llm_model, llm_provider
 
 
 # -----------------------------
@@ -52,30 +56,34 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
 
 
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
-    """
-    Stream graph progress if available; else invoke.
-    Yields ("updates"/"values"/"final", payload).
-    """
-    try:
-        for step in graph_app.stream(inputs, stream_mode="updates"):
-            yield ("updates", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
-        return
-    except Exception:
-        pass
+    latest_state = None
+    for step in graph_app.stream(inputs, stream_mode="values"):
+        latest_state = step
+        yield ("values", step)
 
-    try:
-        for step in graph_app.stream(inputs, stream_mode="values"):
-            yield ("values", step)
-        out = graph_app.invoke(inputs)
-        yield ("final", out)
-        return
-    except Exception:
-        pass
+    if latest_state is None:
+        raise RuntimeError("The workflow completed without returning a state.")
+    yield ("final", latest_state)
 
-    out = graph_app.invoke(inputs)
-    yield ("final", out)
+
+def display_image_file(path: Path, caption: Optional[str] = None) -> None:
+    if path.suffix.lower() != ".svg":
+        st.image(str(path), caption=caption, width="stretch")
+        return
+
+    svg_text = path.read_text(encoding="utf-8")
+    if len(svg_text.encode("utf-8")) > 1_000_000 or re.search(
+        r"<!DOCTYPE|<!ENTITY", svg_text, flags=re.IGNORECASE
+    ):
+        raise ValueError(f"SVG file is oversized or contains a forbidden declaration: {path}")
+
+    root = ET.fromstring(svg_text)
+    if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+        raise ValueError(f"Image file does not contain an SVG root element: {path}")
+
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    normalized_svg = ET.tostring(root, encoding="unicode")
+    st.image(normalized_svg, caption=caption, width="stretch")
 
 
 def extract_latest_state(current_state: Dict[str, Any], step_payload: Any) -> Dict[str, Any]:
@@ -145,11 +153,11 @@ def render_markdown_with_local_images(md: str):
                     parts[i + 1] = ("md", rest)
 
         if src.startswith("http://") or src.startswith("https://"):
-            st.image(src, caption=caption or (alt or None), use_container_width=True)
+            st.image(src, caption=caption or (alt or None), width="stretch")
         else:
             img_path = _resolve_image_path(src)
             if img_path.exists():
-                st.image(str(img_path), caption=caption or (alt or None), use_container_width=True)
+                display_image_file(img_path, caption=caption or (alt or None))
             else:
                 st.warning(f"Image not found: `{src}` (looked for `{img_path}`)")
 
@@ -188,77 +196,67 @@ def extract_title_from_md(md: str, fallback: str) -> str:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="LangGraph Blog Writer", layout="wide")
+st.set_page_config(page_title="Autonomous Research Assistant", page_icon="✍️", layout="wide")
 
-st.title("Blog Writing Agent")
+st.title("Autonomous Research Assistant")
+st.caption("Turn a topic into a researched, reviewed, and ready-to-publish article.")
 
-with st.sidebar:
-    st.header("Generate New Blog")
-    topic = st.text_area(
-        "Topic",
-        height=120,
-    )
-    as_of = st.date_input("As-of date", value=date.today())
-    run_btn = st.button("🚀 Generate Blog", type="primary")
-
-    # ✅ NEW: Past blogs list (keeps everything else intact)
-    st.divider()
-    st.subheader("Past blogs")
-
-    past_files = list_past_blogs()
-    if not past_files:
-        st.caption("No saved blogs found (*.md in current folder).")
-        selected_md_file = None
-    else:
-        # Build labels from file name + (optional) parsed title
-        options: List[str] = []
-        file_by_label: Dict[str, Path] = {}
-        for p in past_files[:50]:
-            try:
-                md_text = read_md_file(p)
-                title = extract_title_from_md(md_text, p.stem)
-            except Exception:
-                title = p.stem
-            label = f"{title}  ·  {p.name}"
-            options.append(label)
-            file_by_label[label] = p
-
-        selected_label = st.radio(
-            "Select a blog to load",
-            options=options,
-            index=0,
-            label_visibility="collapsed",
-        )
-        selected_md_file = file_by_label.get(selected_label)
-
-        if st.button("📂 Load selected blog"):
-            if selected_md_file:
-                md_text = read_md_file(selected_md_file)
-                # Load into session_state as if it were a run output
-                st.session_state["last_out"] = {
-                    "plan": None,          # old files don't include plan
-                    "evidence": [],        # old files don't include evidence
-                    "image_specs": [],     # optional (not persisted)
-                    "final": md_text,      # markdown body
-                }
-                # also update the topic input to the title (best-effort) without changing UI
-                st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
-
-    
-
-# Keep your topic input as-is; optionally prefill for next run after loading a blog
-if "topic_prefill" in st.session_state and isinstance(st.session_state["topic_prefill"], str):
-    # Do not mutate widgets; just keep as a hint.
-    pass
-
-# Storage for latest run
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
+if "logs" not in st.session_state:
+    st.session_state["logs"] = []
 
-# Layout
-tab_plan, tab_evidence, tab_preview, tab_images, tab_logs = st.tabs(
-    ["🧩 Plan", "🔎 Evidence", "📝 Markdown Preview", "🖼️ Images", "🧾 Logs"]
-)
+with st.sidebar:
+    past_files = list_past_blogs()
+    with st.expander(f"Saved blogs ({len(past_files)})", expanded=False):
+        if past_files:
+            options: List[str] = []
+            file_by_label: Dict[str, Path] = {}
+            for path in past_files[:50]:
+                try:
+                    title = extract_title_from_md(read_md_file(path), path.stem)
+                except OSError:
+                    title = path.stem
+                label = f"{title} · {path.name}"
+                options.append(label)
+                file_by_label[label] = path
+
+            selected_label = st.selectbox(
+                "Choose a saved blog",
+                options,
+                label_visibility="collapsed",
+            )
+            if st.button("Load blog", width="stretch"):
+                selected_path = file_by_label[selected_label]
+                md_text = read_md_file(selected_path)
+                st.session_state["last_out"] = {
+                    "plan": None,
+                    "evidence": [],
+                    "image_specs": [],
+                    "final": md_text,
+                }
+                st.session_state["result_view"] = "✍️ Article"
+        else:
+            st.caption("Generated Markdown files will appear here.")
+
+with st.container():
+    with st.form("generate_blog", clear_on_submit=False):
+        st.markdown("#### What should the article cover?")
+        topic = st.text_area(
+            "Topic",
+            height=110,
+            placeholder="For example: How retrieval-augmented generation works",
+            label_visibility="collapsed",
+        )
+        with st.expander("Generation settings"):
+            as_of = st.date_input("Research as of", value=date.today())
+        run_btn = st.form_submit_button(
+            "🚀 Generate article",
+            type="primary",
+            width="stretch",
+        )
+
+st.caption("Research, drafting, and quality evaluation run automatically.")
 
 logs: List[str] = []
 
@@ -285,182 +283,311 @@ if run_btn:
         "merged_md": "",
         "md_with_placeholders": "",
         "image_specs": [],
+        "original_md": "",
+        "evaluation": None,
+        "initial_evaluation": None,
+        "revision_attempts": 0,
+        "revision_applied": False,
         "final": "",
     }
 
-    status = st.status("Running graph…", expanded=True)
-    progress_area = st.empty()
+    status = st.status("Building your article…", expanded=False)
 
     current_state: Dict[str, Any] = {}
     last_node = None
 
-    for kind, payload in try_stream(app, inputs):
-        if kind in ("updates", "values"):
-            node_name = None
-            if isinstance(payload, dict) and len(payload) == 1 and isinstance(next(iter(payload.values())), dict):
-                node_name = next(iter(payload.keys()))
-            if node_name and node_name != last_node:
-                status.write(f"➡️ Node: `{node_name}`")
-                last_node = node_name
+    try:
+        for kind, payload in try_stream(app, inputs):
+            if kind in ("updates", "values"):
+                node_name = None
+                if isinstance(payload, dict) and len(payload) == 1 and isinstance(next(iter(payload.values())), dict):
+                    node_name = next(iter(payload.keys()))
+                if node_name and node_name != last_node:
+                    status.write(f"➡️ Node: `{node_name}`")
+                    last_node = node_name
 
-            current_state = extract_latest_state(current_state, payload)
+                current_state = extract_latest_state(current_state, payload)
 
-            summary = {
-                "mode": current_state.get("mode"),
-                "needs_research": current_state.get("needs_research"),
-                "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
-                "evidence_count": len(current_state.get("evidence", []) or []),
-                "tasks": len((current_state.get("plan") or {}).get("tasks", [])) if isinstance(current_state.get("plan"), dict) else None,
-                "images": len(current_state.get("image_specs", []) or []),
-                "sections_done": len(current_state.get("sections", []) or []),
-            }
-            progress_area.json(summary)
+                log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
 
-            log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
+            elif kind == "final":
+                out = payload
+                st.session_state["last_out"] = out
+                st.session_state["result_view"] = "✍️ Article"
+                status.update(label="✅ Done", state="complete", expanded=False)
+                log("[final] received final state")
+    except LengthFinishReasonError:
+        status.update(
+            label=f"Generation paused: {llm_provider} response limit",
+            state="error",
+            expanded=True,
+        )
+        st.error(
+            "The model response reached its output limit. Research input is now "
+            "bounded; retry, or use a narrower topic if the problem persists."
+        )
+        log(f"[{llm_provider.lower()}-length-limit] Structured model output was truncated.")
+    except OpenAIConnectionError as exc:
+        status.update(
+            label=f"Generation paused: cannot reach {llm_provider}",
+            state="error",
+            expanded=True,
+        )
+        st.error(
+            f"Could not connect to {llm_provider} for model `{llm_model}`. "
+            "Check your internet connection, DNS, VPN, or proxy, then try again."
+        )
+        log(f"[{llm_provider.lower()}-connection-error] {exc}")
+    except ModelRateLimitError as exc:
+        status.update(
+            label=f"Generation paused: {llm_provider} rate limit",
+            state="error",
+            expanded=True,
+        )
+        st.error(
+            f"The {llm_provider} model `{llm_model}` is temporarily rate-limiting requests. "
+            "Wait briefly, then try again."
+        )
+        log(f"[{llm_provider.lower()}-rate-limit] {exc}")
 
-        elif kind == "final":
-            out = payload
-            st.session_state["last_out"] = out
-            status.update(label="✅ Done", state="complete", expanded=False)
-            log("[final] received final state")
+if logs:
+    st.session_state["logs"].extend(logs)
 
 # Render last result (if any)
 out = st.session_state.get("last_out")
+if (
+    isinstance(out, dict)
+    and out.get("final")
+    and out.get("plan")
+    and not isinstance(out.get("evaluation"), dict)
+):
+    plan_obj = out["plan"]
+    plan_title = (
+        plan_obj.blog_title
+        if hasattr(plan_obj, "blog_title")
+        else plan_obj.get("blog_title", "Saved blog")
+    )
+    evaluation_input = {
+        "topic": out.get("topic") or plan_title,
+        "mode": out.get("mode", "closed_book"),
+        "plan": plan_obj,
+        "evidence": out.get("evidence") or [],
+        "merged_md": out["final"],
+        "revision_attempts": 0,
+    }
+    try:
+        evaluation_updates = content_evaluator_node(evaluation_input)
+    except (OpenAIConnectionError, ModelRateLimitError):
+        st.warning(
+            "The current blog has no evaluation report yet. "
+            "Check the model connection or rate limit, then generate again."
+        )
+    else:
+        out.update(evaluation_updates)
+        out["original_md"] = out["final"]
+        out["revision_applied"] = False
+        st.session_state["last_out"] = out
+
+if isinstance(out, dict) and isinstance(out.get("evaluation"), dict):
+    st.success(
+        f"Content quality evaluation complete: "
+        f"{out['evaluation']['overall_score']:.1f}/10. "
+        "Open Quality for the full report."
+    )
+
 if out:
-    # --- Plan tab ---
-    with tab_plan:
-        st.subheader("Plan")
-        plan_obj = out.get("plan")
-        if not plan_obj:
-            st.info("No plan found in output.")
+    plan_obj = out.get("plan")
+    if hasattr(plan_obj, "model_dump"):
+        plan_dict = plan_obj.model_dump()
+    elif isinstance(plan_obj, dict):
+        plan_dict = plan_obj
+    else:
+        plan_dict = {}
+
+    evaluation = out.get("evaluation")
+    evidence = out.get("evidence") or []
+    final_md = out.get("final") or ""
+    blog_title = plan_dict.get("blog_title") or extract_title_from_md(final_md, "Generated article")
+
+    with st.container(border=True):
+        summary_cols = st.columns([2, 1, 1])
+        summary_cols[0].markdown(f"### {blog_title}")
+        if isinstance(evaluation, dict):
+            summary_cols[1].metric("Quality", f"{evaluation['overall_score']:.1f}/10")
         else:
-            if hasattr(plan_obj, "model_dump"):
-                plan_dict = plan_obj.model_dump()
-            elif isinstance(plan_obj, dict):
-                plan_dict = plan_obj
-            else:
-                plan_dict = json.loads(json.dumps(plan_obj, default=str))
+            summary_cols[1].metric("Quality", "Pending")
+        summary_cols[2].metric("Sources", len(evidence))
 
-            st.write("**Title:**", plan_dict.get("blog_title"))
-            cols = st.columns(3)
-            cols[0].write("**Audience:** " + str(plan_dict.get("audience")))
-            cols[1].write("**Tone:** " + str(plan_dict.get("tone")))
-            cols[2].write("**Blog kind:** " + str(plan_dict.get("blog_kind", "")))
+    result_view = st.radio(
+        "Article sections",
+        ["✍️ Article", "⭐ Quality", "🔎 Research", "🧩 Outline", "🖼️ Images", "⚙️ Activity"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="result_view",
+    )
 
-            tasks = plan_dict.get("tasks", [])
-            if tasks:
-                df = pd.DataFrame(
-                    [
-                        {
-                            "id": t.get("id"),
-                            "title": t.get("title"),
-                            "target_words": t.get("target_words"),
-                            "requires_research": t.get("requires_research"),
-                            "requires_citations": t.get("requires_citations"),
-                            "requires_code": t.get("requires_code"),
-                            "tags": ", ".join(t.get("tags") or []),
-                        }
-                        for t in tasks
-                    ]
-                ).sort_values("id")
-                st.dataframe(df, use_container_width=True, hide_index=True)
-
-                with st.expander("Task details"):
-                    st.json(tasks)
-
-    # --- Evidence tab ---
-    with tab_evidence:
-        st.subheader("Evidence")
-        evidence = out.get("evidence") or []
-        if not evidence:
-            st.info("No evidence returned (maybe closed_book mode or no Tavily key/results).")
+    if result_view == "✍️ Article":
+        if final_md:
+            render_markdown_with_local_images(final_md)
+            with st.expander("Download or export"):
+                md_filename = f"{safe_slug(blog_title)}.md"
+                download_cols = st.columns(2)
+                download_cols[0].download_button(
+                    "Download Markdown",
+                    data=final_md.encode("utf-8"),
+                    file_name=md_filename,
+                    mime="text/markdown",
+                    width="stretch",
+                )
+                download_cols[1].download_button(
+                    "Download article bundle",
+                    data=bundle_zip(final_md, md_filename, Path("images")),
+                    file_name=f"{safe_slug(blog_title)}_bundle.zip",
+                    mime="application/zip",
+                    width="stretch",
+                )
         else:
+            st.info("No article content is available.")
+
+    elif result_view == "⭐ Quality":
+        st.subheader("Content quality")
+        if not isinstance(evaluation, dict):
+            st.info("This saved article does not have a quality report.")
+        else:
+            st.metric("Overall score", f"{evaluation['overall_score']:.1f} / 10")
+            st.caption(
+                "AI-assisted assessment, not an independent fact check. "
+                "Review claims against their sources."
+            )
+            score_labels = {
+                "relevance": "Relevance",
+                "factual_accuracy": "Factual accuracy",
+                "completeness": "Completeness",
+                "readability": "Readability",
+                "structure": "Structure",
+                "evidence_and_citations": "Evidence & citations",
+                "technical_depth": "Technical depth",
+            }
+            score_rows = [
+                {"Criterion": label, "Score": evaluation[key], "Out of": 10}
+                for key, label in score_labels.items()
+            ]
+            st.dataframe(pd.DataFrame(score_rows), width="stretch", hide_index=True)
+
+            feedback_cols = st.columns(2)
+            for col, label, key in (
+                (feedback_cols[0], "Strengths", "strengths"),
+                (feedback_cols[1], "Suggestions", "suggestions"),
+                (feedback_cols[0], "Weaknesses", "weaknesses"),
+                (feedback_cols[1], "Claims to verify", "claims_to_verify"),
+            ):
+                with col:
+                    with st.expander(label, expanded=key == "claims_to_verify"):
+                        items = evaluation.get(key) or []
+                        if items:
+                            st.markdown("\n".join(f"- {item}" for item in items))
+                        else:
+                            st.caption("None identified.")
+
+            st.info(evaluation.get("final_remarks") or "No additional remarks.")
+            if out.get("revision_applied"):
+                initial_score = (out.get("initial_evaluation") or {}).get("overall_score")
+                if initial_score is not None:
+                    st.caption(
+                        f"One revision applied: {initial_score:.1f}/10 → "
+                        f"{evaluation['overall_score']:.1f}/10."
+                    )
+                with st.expander("Compare before and after revision"):
+                    before, after = st.columns(2)
+                    with before:
+                        st.markdown("**Before**")
+                        st.markdown(out.get("original_md") or "", unsafe_allow_html=False)
+                    with after:
+                        st.markdown("**After**")
+                        st.markdown(final_md, unsafe_allow_html=False)
+
+    elif result_view == "🔎 Research":
+        st.subheader("Research sources")
+        queries = out.get("queries") or []
+        if queries:
+            with st.expander(f"Search queries ({len(queries)})"):
+                st.markdown("\n".join(f"- {query}" for query in queries))
+        if evidence:
             rows = []
-            for e in evidence:
-                if hasattr(e, "model_dump"):
-                    e = e.model_dump()
+            for item in evidence:
+                item_dict = item.model_dump() if hasattr(item, "model_dump") else item
                 rows.append(
                     {
-                        "title": e.get("title"),
-                        "published_at": e.get("published_at"),
-                        "source": e.get("source"),
-                        "url": e.get("url"),
+                        "Title": item_dict.get("title"),
+                        "Published": item_dict.get("published_at"),
+                        "Source": item_dict.get("source"),
+                        "URL": item_dict.get("url"),
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    # --- Preview tab ---
-    with tab_preview:
-        st.subheader("Markdown Preview")
-        final_md = out.get("final") or ""
-        if not final_md:
-            st.warning("No final markdown found.")
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
         else:
-            render_markdown_with_local_images(final_md)
+            st.info("No sources were needed or returned for this article.")
 
-            plan_obj = out.get("plan")
-            if hasattr(plan_obj, "blog_title"):
-                blog_title = plan_obj.blog_title
-            elif isinstance(plan_obj, dict):
-                blog_title = plan_obj.get("blog_title", "blog")
-            else:
-                # fallback: parse from markdown title
-                blog_title = extract_title_from_md(final_md, "blog")
+    elif result_view == "🧩 Outline":
+        st.subheader("Article outline")
+        if not plan_dict:
+            st.info("No plan is available for this saved article.")
+        else:
+            plan_cols = st.columns(3)
+            plan_cols[0].write(f"**Audience:** {plan_dict.get('audience', '—')}")
+            plan_cols[1].write(f"**Tone:** {plan_dict.get('tone', '—')}")
+            plan_cols[2].write(f"**Type:** {plan_dict.get('blog_kind', '—')}")
+            tasks = plan_dict.get("tasks") or []
+            if tasks:
+                task_rows = [
+                    {
+                        "Section": task.get("title"),
+                        "Target words": task.get("target_words"),
+                        "Research": "Yes" if task.get("requires_research") else "No",
+                        "Citations": "Yes" if task.get("requires_citations") else "No",
+                    }
+                    for task in tasks
+                ]
+                st.dataframe(pd.DataFrame(task_rows), width="stretch", hide_index=True)
+                with st.expander("Section goals and details"):
+                    st.json(tasks)
+            constraints = plan_dict.get("constraints") or []
+            if constraints:
+                with st.expander("Writing constraints"):
+                    st.markdown("\n".join(f"- {item}" for item in constraints))
 
-            md_filename = f"{safe_slug(blog_title)}.md"
-            st.download_button(
-                "⬇️ Download Markdown",
-                data=final_md.encode("utf-8"),
-                file_name=md_filename,
-                mime="text/markdown",
-            )
-
-            bundle = bundle_zip(final_md, md_filename, Path("images"))
-            st.download_button(
-                "📦 Download Bundle (MD + images)",
-                data=bundle,
-                file_name=f"{safe_slug(blog_title)}_bundle.zip",
-                mime="application/zip",
-            )
-
-    # --- Images tab ---
-    with tab_images:
-        st.subheader("Images")
+    elif result_view == "🖼️ Images":
+        st.subheader("Diagrams")
         specs = out.get("image_specs") or []
-        images_dir = Path("images")
-
-        if not specs and not images_dir.exists():
-            st.info("No images generated for this blog.")
+        if not specs:
+            st.info("No diagrams were generated for this article.")
         else:
-            if specs:
-                st.write("**Image plan:**")
+            with st.expander("Diagram plan"):
                 st.json(specs)
-
-            if images_dir.exists():
-                files = [p for p in images_dir.iterdir() if p.is_file()]
-                if not files:
-                    st.warning("images/ exists but is empty.")
+            images_dir = Path("images")
+            for spec in specs:
+                image_path = images_dir / Path(spec.get("filename", "")).name
+                if image_path.is_file():
+                    display_image_file(image_path, caption=spec.get("caption") or image_path.name)
                 else:
-                    for p in sorted(files):
-                        st.image(str(p), caption=p.name, use_container_width=True)
-
-                z = images_zip(images_dir)
-                if z:
+                    st.caption(f"Image file not found: {image_path.name}")
+            with st.expander("Download images"):
+                image_bundle = images_zip(images_dir)
+                if image_bundle:
                     st.download_button(
-                        "⬇️ Download Images (zip)",
-                        data=z,
+                        "Download image bundle",
+                        data=image_bundle,
                         file_name="images.zip",
                         mime="application/zip",
+                        width="stretch",
                     )
 
-    # --- Logs tab ---
-    with tab_logs:
-        st.subheader("Logs")
-        if "logs" not in st.session_state:
-            st.session_state["logs"] = []
-        if logs:
-            st.session_state["logs"].extend(logs)
-
-        st.text_area("Event log", value="\n\n".join(st.session_state["logs"][-80:]), height=520)
+    elif result_view == "⚙️ Activity":
+        st.subheader("Generation activity")
+        recent_logs = st.session_state.get("logs") or []
+        if recent_logs:
+            st.code("\n\n".join(recent_logs[-80:]), language="text")
+        else:
+            st.caption("No activity details are available.")
 else:
-    st.info("Enter a topic and click **Generate Blog**.")
+    st.info("Enter a topic above to generate your first article.")
