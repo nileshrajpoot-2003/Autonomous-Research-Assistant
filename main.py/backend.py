@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
 import operator
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -16,7 +19,9 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
-load_dotenv()
+logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
@@ -73,7 +78,7 @@ class EvidencePack(BaseModel):
 # ---- Image planning schema (ported from your image flow) ----
 class ImageSpec(BaseModel):
     placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
-    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
+    filename: str = Field(..., description="Save under images/ as an SVG, e.g. qkv_flow.svg")
     alt: str
     caption: str
     prompt: str = Field(..., description="Prompt to send to the image model.")
@@ -81,9 +86,35 @@ class ImageSpec(BaseModel):
     quality: Literal["low", "medium", "high"] = "medium"
 
 
-class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str
+class ImagePlan(BaseModel):
     images: List[ImageSpec] = Field(default_factory=list)
+
+
+class ContentEvaluation(BaseModel):
+    relevance: int = Field(..., ge=1, le=10)
+    factual_accuracy: int = Field(..., ge=1, le=10)
+    completeness: int = Field(..., ge=1, le=10)
+    readability: int = Field(..., ge=1, le=10)
+    structure: int = Field(..., ge=1, le=10)
+    evidence_and_citations: int = Field(..., ge=1, le=10)
+    technical_depth: int = Field(..., ge=1, le=10)
+    strengths: List[str] = Field(default_factory=list)
+    weaknesses: List[str] = Field(default_factory=list)
+    claims_to_verify: List[str] = Field(default_factory=list)
+    suggestions: List[str] = Field(default_factory=list)
+    final_remarks: str
+
+
+EVALUATION_SCORE_FIELDS = (
+    "relevance",
+    "factual_accuracy",
+    "completeness",
+    "readability",
+    "structure",
+    "evidence_and_citations",
+    "technical_depth",
+)
+
 
 class State(TypedDict):
     topic: str
@@ -106,6 +137,11 @@ class State(TypedDict):
     merged_md: str
     md_with_placeholders: str
     image_specs: List[dict]
+    original_md: str
+    evaluation: Optional[dict]
+    initial_evaluation: Optional[dict]
+    revision_attempts: int
+    revision_applied: bool
 
     final: str
 
@@ -113,12 +149,41 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOpenAI(
-    model="openai/gpt-4.1-mini",
-    base_url="https://openrouter.ai/api/v1",
-    api_key="",
-    max_tokens=10000
-)
+openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+openrouter_model = os.getenv("OPENROUTER_MODEL", "").strip()
+openrouter_base_url = os.getenv(
+    "OPENROUTER_BASE_URL",
+    "https://openrouter.ai/api/v1",
+).strip().rstrip("/")
+ollama_model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b").strip()
+
+if openrouter_api_key and openrouter_model:
+    llm_provider = "OpenRouter"
+    llm_model = openrouter_model
+    llm = ChatOpenAI(
+        model=openrouter_model,
+        base_url=openrouter_base_url,
+        api_key=openrouter_api_key,
+        max_tokens=10000,
+    )
+else:
+    if openrouter_api_key or openrouter_model:
+        logger.warning(
+            "OpenRouter requires both OPENROUTER_API_KEY and OPENROUTER_MODEL; "
+            "falling back to Ollama."
+        )
+    llm_provider = "Ollama"
+    llm_model = ollama_model
+    ollama_base_url = os.getenv(
+        "OLLAMA_BASE_URL",
+        "http://localhost:11434",
+    ).strip().rstrip("/")
+    llm = ChatOpenAI(
+        model=ollama_model,
+        base_url=f"{ollama_base_url}/v1",
+        api_key="ollama",
+        max_tokens=10000,
+    )
 
 # -----------------------------
 # 3) Router
@@ -168,24 +233,55 @@ def route_next(state: State) -> str:
 # -----------------------------
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
     if not os.getenv("TAVILY_API_KEY"):
+        logger.warning("TAVILY_API_KEY is not set; web research is skipped.")
         return []
     try:
-        from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
-        tool = TavilySearchResults(max_results=max_results)
+        from langchain_tavily import TavilySearch
+
+        tool = TavilySearch(max_results=max_results)
         results = tool.invoke({"query": query})
+        if isinstance(results, str):
+            try:
+                results = json.loads(results)
+            except json.JSONDecodeError:
+                logger.warning("Tavily returned an unrecognized text response.")
+                return []
+        if isinstance(results, dict):
+            if "error" in results:
+                logger.warning("Tavily search failed: %s", results["error"])
+                return []
+            results = results.get("results", [results])
+        if not isinstance(results, list):
+            logger.warning(
+                "Tavily returned an unsupported response type: %s",
+                type(results).__name__,
+            )
+            return []
+
         out: List[dict] = []
         for r in results or []:
+            if not isinstance(r, dict):
+                logger.warning(
+                    "Skipping a Tavily result with unsupported type: %s",
+                    type(r).__name__,
+                )
+                continue
+            title = r.get("title")
+            url = r.get("url")
+            snippet = r.get("content") or r.get("snippet")
+            source = r.get("source")
             out.append(
                 {
-                    "title": r.get("title") or "",
-                    "url": r.get("url") or "",
-                    "snippet": r.get("content") or r.get("snippet") or "",
+                    "title": title[:250] if isinstance(title, str) else "",
+                    "url": url[:1000] if isinstance(url, str) else "",
+                    "snippet": snippet[:400] if isinstance(snippet, str) else "",
                     "published_at": r.get("published_date") or r.get("published_at"),
-                    "source": r.get("source"),
+                    "source": source[:200] if isinstance(source, str) else None,
                 }
             )
         return out
-    except Exception:
+    except Exception as exc:
+        logger.warning("Tavily search failed: %s", exc)
         return []
 
 def _iso_to_date(s: Optional[str]) -> Optional[date]:
@@ -201,23 +297,41 @@ RESEARCH_SYSTEM = """You are a research synthesizer.
 Given raw web search results, produce EvidenceItem objects.
 
 Rules:
+- Return no more than 12 evidence items.
 - Only include items with a non-empty url.
 - Prefer relevant + authoritative sources.
 - Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
-- Keep snippets short.
+- Keep each snippet under 400 characters; do not reproduce full page content.
 - Deduplicate by URL.
 """
 
+MAX_RESEARCH_QUERIES = 6
+MAX_RESULTS_PER_QUERY = 3
+MAX_RAW_RESULTS = 15
+MAX_EVIDENCE_ITEMS = 12
+
+
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:10]
+    queries = (state.get("queries") or [])[:MAX_RESEARCH_QUERIES]
     raw: List[dict] = []
+    seen_urls = set()
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+        remaining = MAX_RAW_RESULTS - len(raw)
+        if remaining <= 0:
+            break
+        results = _tavily_search(q, max_results=min(MAX_RESULTS_PER_QUERY, remaining))
+        for result in results:
+            url = result.get("url")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                raw.append(result)
+                if len(raw) >= MAX_RAW_RESULTS:
+                    break
 
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
+    extractor = llm.bind(max_tokens=3000).with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -225,7 +339,7 @@ def research_node(state: State) -> dict:
                 content=(
                     f"As-of date: {state['as_of']}\n"
                     f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
+                    f"Raw results:\n{json.dumps(raw, ensure_ascii=False)}"
                 )
             ),
         ]
@@ -235,7 +349,7 @@ def research_node(state: State) -> dict:
     for e in pack.evidence:
         if e.url:
             dedup[e.url] = e
-    evidence = list(dedup.values())
+    evidence = list(dedup.values())[:MAX_EVIDENCE_ITEMS]
 
     if state.get("mode") == "open_book":
         as_of = date.fromisoformat(state["as_of"])
@@ -257,7 +371,7 @@ Requirements:
 Grounding:
 - closed_book: evergreen, no evidence dependence.
 - hybrid: use evidence for up-to-date examples; mark those tasks requires_research=True and requires_citations=True.
-- open_book: weekly/news roundup:
+- open_book: weekly/news roundup: 
   - Set blog_kind="news_roundup"
   - No tutorial content unless requested
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
@@ -379,8 +493,8 @@ def worker_node(payload: dict) -> dict:
     return {"sections": [(task.id, section_md)]}
 
 # ============================================================
-# 8) ReducerWithImages (subgraph)
-#    merge_content -> decide_images -> generate_and_place_images
+# 8) Content evaluation, revision, and image reduction (subgraph)
+#    merge -> evaluate -> (revise once?) -> decide_images -> generate/place
 # ============================================================
 def merge_content(state: State) -> dict:
     plan = state["plan"]
@@ -389,7 +503,138 @@ def merge_content(state: State) -> dict:
     ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
     body = "\n\n".join(ordered_sections).strip()
     merged_md = f"# {plan.blog_title}\n\n{body}\n"
-    return {"merged_md": merged_md}
+    return {"merged_md": merged_md, "original_md": merged_md}
+
+
+EVALUATOR_SYSTEM = """You are an expert technical content evaluator.
+Evaluate the complete blog against the user's topic, the planned sections, and
+the supplied evidence. Score each criterion from 1 to 10:
+
+- relevance: how directly the article addresses the topic
+- factual_accuracy: technical correctness and whether claims are supported
+- completeness: coverage of planned sections and important points
+- readability: clarity, flow, and suitable language for the audience
+- structure: useful headings, paragraphs, and organization
+- evidence_and_citations: reliable, relevant source links for factual claims
+- technical_depth: adequate explanations, examples, and technical detail
+
+Do not treat the supplied evidence as proof for claims it does not support.
+You cannot independently verify facts beyond the supplied evidence; list
+uncertain, unsupported, or citation-sensitive claims in claims_to_verify.
+Give specific, actionable strengths, weaknesses, and suggestions. Avoid
+inflating scores. Return only the requested structured evaluation.
+"""
+
+REVISION_SYSTEM = """You are a careful technical editor revising a complete blog.
+Use the evaluation feedback to improve the article. Preserve its topic,
+intended audience, useful structure, and all planned sections. Correct or
+qualify unsupported claims; do not invent facts or citations. Keep existing
+valid source URLs attached to the claims they support. Return only the
+complete revised article in Markdown, without commentary or code fences.
+"""
+
+EVALUATION_THRESHOLD = 7.0
+MAX_REVISION_ATTEMPTS = 1
+
+
+def _evaluation_context(state: State) -> tuple[Plan, list[dict]]:
+    plan = state.get("plan")
+    if plan is None:
+        raise ValueError("Content evaluation called without a plan.")
+    if isinstance(plan, dict):
+        plan = Plan(**plan)
+
+    evidence = []
+    for item in state.get("evidence", []) or []:
+        evidence_item = item if isinstance(item, EvidenceItem) else EvidenceItem(**item)
+        evidence.append(
+            {
+                **evidence_item.model_dump(),
+                "snippet": (evidence_item.snippet or "")[:600],
+            }
+        )
+    return plan, evidence[:20]
+
+
+def content_evaluator_node(state: State) -> dict:
+    plan, evidence = _evaluation_context(state)
+    content = state.get("merged_md", "").strip()
+    if not content:
+        raise ValueError("Content evaluation received an empty blog.")
+
+    evaluator = llm.bind(max_tokens=3500).with_structured_output(ContentEvaluation)
+    evaluation = evaluator.invoke(
+        [
+            SystemMessage(content=EVALUATOR_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"User topic: {state['topic']}\n"
+                    f"Blog mode: {state.get('mode', 'closed_book')}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Planned sections and goals:\n"
+                    f"{json.dumps([task.model_dump() for task in plan.tasks], ensure_ascii=False)}\n"
+                    f"Available evidence:\n{json.dumps(evidence, ensure_ascii=False)}\n\n"
+                    f"Generated blog:\n{content}"
+                )
+            ),
+        ]
+    )
+    report = evaluation.model_dump()
+    report["overall_score"] = round(
+        sum(report[field] for field in EVALUATION_SCORE_FIELDS)
+        / len(EVALUATION_SCORE_FIELDS),
+        1,
+    )
+
+    updates = {"evaluation": report}
+    if not state.get("revision_attempts", 0):
+        updates["initial_evaluation"] = report
+    return updates
+
+
+def route_after_evaluation(state: State) -> str:
+    evaluation = state.get("evaluation")
+    if evaluation is None:
+        raise ValueError("Evaluation routing called without an evaluation report.")
+    if (
+        evaluation["overall_score"] < EVALUATION_THRESHOLD
+        and state.get("revision_attempts", 0) < MAX_REVISION_ATTEMPTS
+    ):
+        return "revise"
+    return "images"
+
+
+def revise_content_node(state: State) -> dict:
+    plan, evidence = _evaluation_context(state)
+    evaluation = state.get("evaluation")
+    if evaluation is None:
+        raise ValueError("Content revision called without evaluation feedback.")
+
+    response = llm.bind(max_tokens=10000).invoke(
+        [
+            SystemMessage(content=REVISION_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"User topic: {state['topic']}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Planned sections and goals:\n"
+                    f"{json.dumps([task.model_dump() for task in plan.tasks], ensure_ascii=False)}\n"
+                    f"Available evidence:\n{json.dumps(evidence, ensure_ascii=False)}\n"
+                    f"Evaluation feedback:\n{json.dumps(evaluation, ensure_ascii=False)}\n\n"
+                    f"Current blog:\n{state['merged_md']}"
+                )
+            ),
+        ]
+    )
+    revised_content = response.content
+    if not isinstance(revised_content, str) or not revised_content.strip():
+        raise ValueError("The content revision model returned no Markdown text.")
+
+    return {
+        "merged_md": revised_content.strip(),
+        "revision_attempts": state.get("revision_attempts", 0) + 1,
+        "revision_applied": True,
+    }
 
 
 DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
@@ -398,15 +643,13 @@ Decide if images/diagrams are needed for THIS blog.
 Rules:
 - Max 3 images total.
 - Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-- If no images needed: md_with_placeholders must equal input and images=[].
+- Use descriptive .svg filenames; images are generated as vector diagrams.
 - Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
+Return only image specs; do not rewrite or quote the blog.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
-    merged_md = state["merged_md"]
+    planner = llm.bind(max_tokens=6000).with_structured_output(ImagePlan)
     plan = state["plan"]
     assert plan is not None
 
@@ -415,67 +658,106 @@ def decide_images(state: State) -> dict:
             SystemMessage(content=DECIDE_IMAGES_SYSTEM),
             HumanMessage(
                 content=(
+                    f"Blog title: {plan.blog_title}\n"
                     f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
+                    f"Topic: {state['topic']}\n"
+                    "Sections:\n"
+                    + "\n".join(
+                        f"- {task.title}: {task.goal}"
+                        for task in plan.tasks
+                    )
                 )
             ),
         ]
     )
 
+    image_specs = [
+        {**img.model_dump(), "placeholder": f"[[IMAGE_{index}]]"}
+        for index, img in enumerate(image_plan.images[:3], start=1)
+    ]
+    md_with_placeholders = state["merged_md"]
+    if image_specs:
+        image_section = "\n\n## Diagrams\n\n" + "\n\n".join(
+            f"[[IMAGE_{index}]]" for index in range(1, len(image_specs) + 1)
+        )
+        md_with_placeholders = md_with_placeholders.rstrip() + image_section + "\n"
+
     return {
-        "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [img.model_dump() for img in image_plan.images],
+        "md_with_placeholders": md_with_placeholders,
+        "image_specs": image_specs,
     }
 
 
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
-    """
-    from google import genai
-    from google.genai import types
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
-
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
+def _generate_svg(prompt: str) -> bytes:
+    """Generate and validate an SVG technical diagram with the configured model."""
+    system_prompt = (
+        "Create a clear, self-contained SVG technical diagram. "
+        "Return only valid SVG XML, with a 1200x675 viewBox. Use readable "
+        "labels, simple shapes, arrows, and a restrained color palette. "
+        "Use only svg, g, rect, circle, ellipse, line, polyline, polygon, "
+        "path, text, tspan, defs, and marker elements. Do not include "
+        "scripts, styles, links, images, or non-SVG explanation."
     )
+    allowed_elements = {
+        "svg", "g", "rect", "circle", "ellipse", "line", "polyline",
+        "polygon", "path", "text", "tspan", "defs", "marker",
+    }
+    allowed_attributes = {
+        "viewBox", "width", "height", "x", "y", "x1", "y1", "x2", "y2",
+        "cx", "cy", "r", "rx", "ry", "points", "d", "fill", "stroke",
+        "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray",
+        "opacity", "fill-opacity", "stroke-opacity", "transform", "font-size",
+        "font-family", "font-weight", "text-anchor", "dominant-baseline",
+        "id", "marker-end", "marker-start", "markerWidth", "markerHeight",
+        "refX", "refY", "orient", "preserveAspectRatio",
+    }
+    validation_error = None
+    for attempt in range(2):
+        instruction = system_prompt
+        if validation_error:
+            instruction += (
+                f" Your previous response was invalid ({validation_error}). "
+                "Regenerate the entire diagram as well-formed SVG XML."
+            )
+        response = llm.invoke(
+            [
+                SystemMessage(content=instruction),
+                HumanMessage(content=prompt),
+            ]
+        )
+        svg_text = response.content
+        if not isinstance(svg_text, str):
+            raise ValueError("The local model did not return SVG text.")
 
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
         try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
+            svg_match = re.search(r"<svg\b[\s\S]*?</svg\s*>", svg_text, flags=re.IGNORECASE)
+            if not svg_match:
+                raise ValueError("The response did not contain an SVG document.")
+            svg_text = svg_match.group(0)
+            if len(svg_text.encode("utf-8")) > 1_000_000:
+                raise ValueError("The generated SVG exceeded the 1 MB size limit.")
+            if re.search(r"<!DOCTYPE|<!ENTITY", svg_text, flags=re.IGNORECASE):
+                raise ValueError("The generated SVG contains a forbidden XML declaration.")
 
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
+            root = ET.fromstring(svg_text)
+            if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+                raise ValueError("The generated document root is not SVG.")
 
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
+            for element in root.iter():
+                if element.tag.rsplit("}", 1)[-1].lower() not in allowed_elements:
+                    raise ValueError("The generated SVG contains an unsupported element.")
+                if any(
+                    attribute.rsplit("}", 1)[-1] not in allowed_attributes
+                    for attribute in element.attrib
+                ):
+                    raise ValueError("The generated SVG contains an unsupported attribute.")
 
-    raise RuntimeError("No inline image bytes found in response.")
+            ET.register_namespace("", "http://www.w3.org/2000/svg")
+            return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        except (ET.ParseError, ValueError) as exc:
+            validation_error = exc
+
+    raise ValueError(f"The local model returned invalid SVG twice: {validation_error}") from validation_error
 
 
 def _safe_slug(title: str) -> str:
@@ -503,16 +785,23 @@ def generate_and_place_images(state: State) -> dict:
 
     for spec in image_specs:
         placeholder = spec["placeholder"]
-        filename = spec["filename"]
-        out_path = images_dir / filename
-
-        # generate only if needed
-        if not out_path.exists():
+        image_stem = Path(spec["filename"]).stem or "diagram"
+        out_path = next(
+            (
+                images_dir / f"{image_stem}{extension}"
+                for extension in (".svg", ".png", ".jpg", ".webp")
+                if (images_dir / f"{image_stem}{extension}").exists()
+            ),
+            None,
+        )
+        if out_path is None:
             try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
+                img_bytes = _generate_svg(spec["prompt"])
+                filename = f"{image_stem}.svg"
+                out_path = images_dir / filename
                 out_path.write_bytes(img_bytes)
             except Exception as e:
-                # graceful fallback: keep doc usable
+                logger.exception("Image generation failed for %s", image_stem)
                 prompt_block = (
                     f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
                     f"> **Alt:** {spec.get('alt','')}\n>\n"
@@ -522,7 +811,8 @@ def generate_and_place_images(state: State) -> dict:
                 md = md.replace(placeholder, prompt_block)
                 continue
 
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        spec["filename"] = out_path.name
+        img_md = f"![{spec['alt']}](images/{out_path.name})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
     filename = f"{_safe_slug(plan.blog_title)}.md"
@@ -532,10 +822,18 @@ def generate_and_place_images(state: State) -> dict:
 # build reducer subgraph
 reducer_graph = StateGraph(State)
 reducer_graph.add_node("merge_content", merge_content)
+reducer_graph.add_node("evaluate_content", content_evaluator_node)
+reducer_graph.add_node("revise_content", revise_content_node)
 reducer_graph.add_node("decide_images", decide_images)
 reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
 reducer_graph.add_edge(START, "merge_content")
-reducer_graph.add_edge("merge_content", "decide_images")
+reducer_graph.add_edge("merge_content", "evaluate_content")
+reducer_graph.add_conditional_edges(
+    "evaluate_content",
+    route_after_evaluation,
+    {"revise": "revise_content", "images": "decide_images"},
+)
+reducer_graph.add_edge("revise_content", "evaluate_content")
 reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
