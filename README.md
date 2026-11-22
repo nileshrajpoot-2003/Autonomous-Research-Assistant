@@ -1,4 +1,4 @@
-# Agentic AI Research & Content Generation Agent
+# Autonomous Research Assistant
 
 An agentic AI system that autonomously researches user-provided topics using web search, synthesizes information, generates structured blog content and relevant visuals, and exports the final result as a Markdown document.
 
